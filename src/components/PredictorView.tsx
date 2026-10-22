@@ -1,12 +1,27 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   FlowerInput,
   predictFlowerSpecies,
   FEATURE_BOUNDS,
+  TARGET_SPECIES,
 } from '../utils/classifier';
 import { PRESET_SPECIMENS } from '../data/irisData';
 import { FlowerMorphologyVisualizer } from './FlowerMorphologyVisualizer';
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, Server, Zap, CheckCircle2 } from 'lucide-react';
+
+interface ApiPredictionResponse {
+  status: string;
+  engine?: string;
+  predicted_class: number;
+  species: 'setosa' | 'versicolor' | 'virginica';
+  display_name: string;
+  confidence: number;
+  probabilities: {
+    setosa: number;
+    versicolor: number;
+    virginica: number;
+  };
+}
 
 export const PredictorView: React.FC = () => {
   const [inputs, setInputs] = useState<FlowerInput>({
@@ -17,9 +32,12 @@ export const PredictorView: React.FC = () => {
   });
 
   const [activePreset, setActivePreset] = useState<string>('Typical Setosa');
+  const [apiResult, setApiResult] = useState<ApiPredictionResponse | null>(null);
+  const [apiStatus, setApiStatus] = useState<'idle' | 'calling' | 'success' | 'fallback'>('idle');
+  const [latency, setLatency] = useState<number | null>(null);
 
-  // Compute prediction
-  const { result, error } = useMemo(() => {
+  // Instant client-side computation
+  const { result: clientResult, error } = useMemo(() => {
     try {
       const pred = predictFlowerSpecies(inputs);
       return { result: pred, error: null };
@@ -27,6 +45,64 @@ export const PredictorView: React.FC = () => {
       return { result: null, error: err.message || 'Validation error' };
     }
   }, [inputs]);
+
+  // Connect to Python serverless API (/api/predict)
+  useEffect(() => {
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setApiStatus('calling');
+      const start = performance.now();
+      try {
+        const res = await fetch('/api/predict', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(inputs),
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!cancelled && data.status === 'success') {
+          setApiResult(data);
+          setLatency(Math.max(1, Math.round(performance.now() - start)));
+          setApiStatus('success');
+        }
+      } catch {
+        if (!cancelled) {
+          setApiStatus('fallback');
+        }
+      }
+    }, 150);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [inputs]);
+
+  // Display Python API result if connected; otherwise seamlessly use client engine
+  const activeResult = useMemo(() => {
+    if (apiStatus === 'success' && apiResult) {
+      return {
+        species: apiResult.species,
+        displayName: apiResult.display_name,
+        confidence: Math.round(apiResult.confidence * 100),
+        probabilities: apiResult.probabilities,
+        engine: apiResult.engine || 'Python Scikit-Learn API',
+        isApi: true,
+      };
+    }
+    if (clientResult) {
+      return {
+        species: clientResult.species,
+        displayName: clientResult.displayName,
+        confidence: clientResult.confidence,
+        probabilities: clientResult.probabilities,
+        engine: clientResult.modelName,
+        isApi: false,
+      };
+    }
+    return null;
+  }, [apiStatus, apiResult, clientResult]);
 
   const handleInputChange = (field: keyof FlowerInput, val: number) => {
     setActivePreset('Custom');
@@ -66,12 +142,42 @@ export const PredictorView: React.FC = () => {
       textColor: 'text-amber-700',
       barColor: 'bg-amber-600',
     },
-  }[result?.species || 'setosa'];
+  }[activeResult?.species || 'setosa'];
 
   return (
     <div className="space-y-6">
+      {/* Top Architecture Pill */}
+      <div className="neu-flat rounded-xl px-4 py-2.5 flex flex-wrap items-center justify-between text-xs font-semibold text-slate-700 gap-2">
+        <div className="flex items-center gap-2">
+          <span className="font-black uppercase tracking-wider text-slate-400 text-[10px]">Architecture</span>
+          <span className="font-bold text-slate-800">React + Vite (Frontend)</span>
+          <span className="text-slate-400">•</span>
+          <span className="font-bold text-slate-800">Python ML (Backend API)</span>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {apiStatus === 'success' ? (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800 font-bold border border-emerald-300">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <Server className="w-3.5 h-3.5" />
+              Python Scikit-Learn API ({latency}ms)
+            </span>
+          ) : apiStatus === 'calling' ? (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-100 text-amber-800 font-bold border border-amber-300">
+              <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping" />
+              Calling /api/predict...
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-indigo-100 text-indigo-800 font-bold border border-indigo-200" title="Zero-latency client fallback engine active">
+              <Zap className="w-3.5 h-3.5 text-indigo-600" />
+              Edge Client Engine Active
+            </span>
+          )}
+        </div>
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Left Column: Physical Inputs & 3D Controls */}
+        {/* Left Column: Physical Inputs & Controls */}
         <div className="lg:col-span-6 space-y-6">
           {/* Specimen Presets */}
           <div className="neu-flat rounded-2xl p-5 space-y-3">
@@ -179,8 +285,8 @@ export const PredictorView: React.FC = () => {
                 id="sepal-width-slider"
                 aria-label="Sepal Width"
                 type="range"
-                min="1.8"
-                max="4.6"
+                min="1.5"
+                max="5.0"
                 step="0.1"
                 value={inputs.sepal_width}
                 onChange={(e) =>
@@ -262,7 +368,7 @@ export const PredictorView: React.FC = () => {
           </div>
         </div>
 
-        {/* Right Column: 3D Botanical Visualizer & Prediction Panel */}
+        {/* Right Column: Visualizer & Prediction Panel */}
         <div className="lg:col-span-6 space-y-6">
           {error ? (
             <div className="neu-flat rounded-2xl p-6 text-rose-700 neu-inset">
@@ -272,25 +378,30 @@ export const PredictorView: React.FC = () => {
               </div>
               <p className="text-xs mt-1 font-medium">{error}</p>
             </div>
-          ) : result ? (
+          ) : activeResult ? (
             <div className="neu-flat rounded-2xl p-6 space-y-6">
               {/* Dynamic 3D Flower Visualizer */}
               <div className="flex justify-center">
-                <FlowerMorphologyVisualizer inputs={inputs} species={result.species} />
+                <FlowerMorphologyVisualizer inputs={inputs} species={activeResult.species} />
               </div>
 
-              {/* 3D Elevated Result Banner */}
+              {/* Elevated Result Banner */}
               <div className="neu-inset rounded-2xl p-5 flex items-center justify-between">
                 <div>
-                  <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">
-                    Predicted Species
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                      Predicted Species
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-slate-200 text-slate-700">
+                      {activeResult.engine}
+                    </span>
                   </div>
-                  <h3 className={`text-2xl font-black italic tracking-tight ${speciesStyles.textColor}`}>
-                    {result.displayName}
+                  <h3 className={`text-2xl font-black italic tracking-tight mt-1 ${speciesStyles.textColor}`}>
+                    {activeResult.displayName}
                   </h3>
                 </div>
                 <div className={`px-4 py-2 rounded-xl text-white font-black text-sm ${speciesStyles.pillClass}`}>
-                  {result.confidence}% Match
+                  {activeResult.confidence}% Match
                 </div>
               </div>
 
@@ -307,12 +418,12 @@ export const PredictorView: React.FC = () => {
                       <span className="w-2.5 h-2.5 rounded-full bg-blue-600" />
                       Iris setosa
                     </span>
-                    <span className="font-mono">{(result.probabilities.setosa * 100).toFixed(1)}%</span>
+                    <span className="font-mono">{(activeResult.probabilities.setosa * 100).toFixed(1)}%</span>
                   </div>
                   <div className="neu-inset h-3 rounded-full overflow-hidden p-0.5">
                     <div
                       className="bg-blue-600 h-full rounded-full transition-all duration-300 shadow-xs"
-                      style={{ width: `${result.probabilities.setosa * 100}%` }}
+                      style={{ width: `${activeResult.probabilities.setosa * 100}%` }}
                     />
                   </div>
                 </div>
@@ -324,12 +435,12 @@ export const PredictorView: React.FC = () => {
                       <span className="w-2.5 h-2.5 rounded-full bg-emerald-600" />
                       Iris versicolor
                     </span>
-                    <span className="font-mono">{(result.probabilities.versicolor * 100).toFixed(1)}%</span>
+                    <span className="font-mono">{(activeResult.probabilities.versicolor * 100).toFixed(1)}%</span>
                   </div>
                   <div className="neu-inset h-3 rounded-full overflow-hidden p-0.5">
                     <div
                       className="bg-emerald-600 h-full rounded-full transition-all duration-300 shadow-xs"
-                      style={{ width: `${result.probabilities.versicolor * 100}%` }}
+                      style={{ width: `${activeResult.probabilities.versicolor * 100}%` }}
                     />
                   </div>
                 </div>
@@ -341,12 +452,12 @@ export const PredictorView: React.FC = () => {
                       <span className="w-2.5 h-2.5 rounded-full bg-amber-600" />
                       Iris virginica
                     </span>
-                    <span className="font-mono">{(result.probabilities.virginica * 100).toFixed(1)}%</span>
+                    <span className="font-mono">{(activeResult.probabilities.virginica * 100).toFixed(1)}%</span>
                   </div>
                   <div className="neu-inset h-3 rounded-full overflow-hidden p-0.5">
                     <div
                       className="bg-amber-600 h-full rounded-full transition-all duration-300 shadow-xs"
-                      style={{ width: `${result.probabilities.virginica * 100}%` }}
+                      style={{ width: `${activeResult.probabilities.virginica * 100}%` }}
                     />
                   </div>
                 </div>
